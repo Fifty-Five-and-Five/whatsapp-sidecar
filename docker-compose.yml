@@ -1,0 +1,25 @@
+services:
+  whatsapp-sidecar:
+    build: .
+    image: earl-whatsapp-sidecar:latest
+    container_name: whatsapp-sidecar
+    restart: unless-stopped
+    environment:
+      - PORT=3030
+      - LOG_LEVEL=info
+      - SIDECAR_TOKEN=${SIDECAR_TOKEN}
+      - WHATSAPP_GROUP_JID=${WHATSAPP_GROUP_JID:-}
+      - WHATSAPP_PRIMARY_USER_ID=${WHATSAPP_PRIMARY_USER_ID}
+      - SESSION_DIR=/session
+    volumes:
+      - session:/session
+    networks:
+      - coolify
+    # No Traefik labels — sidecar is internal-only, reached via container DNS.
+
+networks:
+  coolify:
+    external: true
+
+volumes:
+  session:

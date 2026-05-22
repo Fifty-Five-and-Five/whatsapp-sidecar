@@ -1,0 +1,20 @@
+{
+  "name": "earl-whatsapp-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "fastify": "^5.2.1",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}
