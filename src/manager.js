@@ -139,7 +139,38 @@ export class SessionManager extends EventEmitter {
     }
     this.clients.set(userId, client);
     await client.start();
+    // Don't return until this session's handshake has settled, so the
+    // caller's serial await loop genuinely serialises Baileys boots.
+    // Without this, three sessions fire their fetchProps queries from the
+    // same IP simultaneously and WhatsApp throttles them all into a 408
+    // loop that blocks message delivery (see incident 2026-05-24).
+    await this._waitForSettle(client);
     return client;
+  }
+
+  _waitForSettle(client) {
+    return new Promise((resolve) => {
+      const SETTLED = new Set(['connected', 'qr', 'logged_out']);
+      if (SETTLED.has(client.status)) {
+        resolve();
+        return;
+      }
+      const onStatus = (s) => {
+        if (!SETTLED.has(s)) return;
+        client.off('status', onStatus);
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        client.off('status', onStatus);
+        this.logger.warn(
+          { status: client.status },
+          'session did not settle within 30s — proceeding anyway',
+        );
+        resolve();
+      }, 30000);
+      client.on('status', onStatus);
+    });
   }
 
   primary() {
