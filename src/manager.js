@@ -160,8 +160,16 @@ export class SessionManager extends EventEmitter {
 
   async createSession(userId) {
     if (!isValidUserId(userId)) throw new Error('userId must be 1-64 chars of [A-Za-z0-9_.-]');
-    if (this.clients.has(userId)) {
-      return this.clients.get(userId);
+    const existing = this.clients.get(userId);
+    // A live or pairing-in-progress client is reusable — don't disturb it.
+    // A logged_out or disconnected client is dead weight: returning it gives
+    // the caller nothing useful (no fresh QR will appear) and looks like a
+    // silent no-op. Tear it down and start fresh so re-pair works.
+    if (existing && existing.status !== 'logged_out' && existing.status !== 'disconnected') {
+      return existing;
+    }
+    if (existing) {
+      await this.deleteSession(userId);
     }
     const mode = userId === this.primaryUserId ? 'primary' : 'sender-only';
     return this._launchClient(userId, mode);
