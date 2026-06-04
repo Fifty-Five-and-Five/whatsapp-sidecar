@@ -27,6 +27,16 @@ const MEDIA_CAP_BYTES = Number(process.env.MEDIA_CAP_BYTES || 500 * 1024 * 1024)
 
 const MEDIA_FIELDS = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
 
+// WhatsApp message timestamps come in two flavours: seconds-since-epoch
+// (typical `messageTimestamp`) and ms-since-epoch (`reactionMessage.
+// senderTimestampMs`). Anything past 1e12 we treat as ms; anything else we
+// multiply. Missing/zero falls back to now.
+function coerceWaTimestampMs(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return Date.now();
+  return n > 1e12 ? n : n * 1000;
+}
+
 function parseNameOverrides() {
   const raw = process.env.WHATSAPP_NAME_OVERRIDES || '';
   const out = new Map();
