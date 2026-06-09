@@ -58,6 +58,8 @@ app.get('/messages', async (req) => {
 
 app.post('/messages', async (req, reply) => {
   const body = req.body?.body;
+  // `to` (phone number or JID) sends a 1:1 message; omit it to post to the group.
+  const to = typeof req.body?.to === 'string' ? req.body.to : null;
   const senderName = req.body?.senderName;
   const quoted = req.body?.quoted || null;
   // `via` is trusted because the bearer token already authenticated this call
@@ -71,7 +73,7 @@ app.post('/messages', async (req, reply) => {
   }
   const userId = via || manager.primaryUserId;
   try {
-    const sent = await manager.send({ userId, body, senderName, quoted });
+    const sent = await manager.send({ userId, to, body, senderName, quoted });
     return { ok: true, message: sent };
   } catch (err) {
     if (err.code === 'NOT_PAIRED') {

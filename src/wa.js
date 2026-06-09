@@ -19,6 +19,7 @@ const SESSION_DIR = process.env.SESSION_DIR || '/session';
 const BUFFER_PATH = path.join(SESSION_DIR, 'buffer.json');
 const ANCHOR_PATH = path.join(SESSION_DIR, 'anchor.json');
 const CONTACTS_PATH = path.join(SESSION_DIR, 'contacts.json');
+const DIRECT_PEERS_PATH = path.join(SESSION_DIR, 'direct-peers.json');
 const MEDIA_DIR = path.join(SESSION_DIR, 'media');
 const RECONNECT_DELAY_MS = 2000;
 const REPLAY_BUFFER_LIMIT = 5000;
@@ -35,6 +36,15 @@ function coerceWaTimestampMs(raw) {
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return Date.now();
   return n > 1e12 ? n : n * 1000;
+}
+
+// Normalise a recipient to a WhatsApp JID. Accepts an existing JID (contains
+// '@') or a phone number in any format which becomes <digits>@s.whatsapp.net.
+function toJid(to) {
+  if (!to || typeof to !== 'string') return null;
+  if (to.includes('@')) return to;
+  const digits = to.replace(/[^0-9]/g, '');
+  return digits ? `${digits}@s.whatsapp.net` : null;
 }
 
 function parseNameOverrides() {
@@ -159,6 +169,11 @@ export class WhatsAppClient extends EventEmitter {
     this._anchorFlushTimer = null;
     this.contacts = new Map();
     this.contactsFlushTimer = null;
+    // 1:1 outreach peers we have messaged via the engine. We only capture
+    // inbound direct messages from JIDs in this set, so the sidecar never
+    // ingests the owner's unrelated personal chats.
+    this.directPeers = new Set();
+    this.directPeersFlushTimer = null;
     this.nameOverrides = parseNameOverrides();
   }
 
@@ -170,6 +185,7 @@ export class WhatsAppClient extends EventEmitter {
       await this._loadBuffer();
       await this._loadAnchor();
       await this._loadContacts();
+      await this._loadDirectPeers();
     }
     const { state, saveCreds } = await useMultiFileAuthState(this.baileysDir);
     const { version } = await fetchLatestBaileysVersion();
@@ -360,15 +376,25 @@ export class WhatsAppClient extends EventEmitter {
     }
 
     const jid = msg.key.remoteJid;
-    if (!jid?.endsWith('@g.us')) return false;
+    const isGroup = jid?.endsWith('@g.us');
+    const isDirect = jid?.endsWith('@s.whatsapp.net');
 
-    if (this.groupJid) {
-      if (jid !== this.groupJid) return false;
+    if (isGroup) {
+      if (this.groupJid) {
+        if (jid !== this.groupJid) return false;
+      } else {
+        this.logger.info(
+          { groupJid: jid, subject: this.groupNameCache.get(jid)?.subject },
+          'inbound group message — set WHATSAPP_GROUP_JID to this to scope the sidecar',
+        );
+        return false;
+      }
+    } else if (isDirect) {
+      // Only capture 1:1 chats with people the engine has messaged (outreach
+      // peers in directPeers). Everything else — the owner's personal DMs — is
+      // ignored, so the sidecar never ingests unrelated private conversations.
+      if (!this.directPeers.has(jid)) return false;
     } else {
-      this.logger.info(
-        { groupJid: jid, subject: this.groupNameCache.get(jid)?.subject },
-        'inbound group message — set WHATSAPP_GROUP_JID to this to scope the sidecar',
-      );
       return false;
     }
 
@@ -673,6 +699,43 @@ export class WhatsAppClient extends EventEmitter {
     }
   }
 
+  _scheduleDirectPeersFlush() {
+    if (this.directPeersFlushTimer) return;
+    this.directPeersFlushTimer = setTimeout(() => {
+      this.directPeersFlushTimer = null;
+      this._flushDirectPeers().catch((err) =>
+        this.logger.warn({ err }, 'direct-peers flush failed'),
+      );
+    }, BUFFER_FLUSH_DEBOUNCE_MS);
+  }
+
+  _addDirectPeer(jid) {
+    if (!jid || this.directPeers.has(jid)) return;
+    this.directPeers.add(jid);
+    this._scheduleDirectPeersFlush();
+  }
+
+  async _flushDirectPeers() {
+    const tmp = `${DIRECT_PEERS_PATH}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify([...this.directPeers]), 'utf-8');
+    await fs.rename(tmp, DIRECT_PEERS_PATH);
+  }
+
+  async _loadDirectPeers() {
+    try {
+      const raw = await fs.readFile(DIRECT_PEERS_PATH, 'utf-8');
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        for (const j of arr) this.directPeers.add(j);
+        this.logger.info({ count: this.directPeers.size }, 'direct peers loaded from disk');
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        this.logger.warn({ err }, 'failed to load direct peers');
+      }
+    }
+  }
+
   async fetchOlder(count = 100) {
     if (this.status !== 'connected') {
       throw new Error(`not connected (status=${this.status})`);
@@ -715,19 +778,22 @@ export class WhatsAppClient extends EventEmitter {
     return items;
   }
 
-  async sendText({ body, senderName, quoted }) {
+  async sendText({ to, body, senderName, quoted }) {
     if (this.status !== 'connected') {
       throw new Error(`not connected (status=${this.status})`);
     }
-    if (!this.groupJid) {
-      throw new Error('WHATSAPP_GROUP_JID is not configured');
+    // `to` (a phone number or JID) sends 1:1; omit it to post to the group.
+    const target = toJid(to) || this.groupJid;
+    if (!target) {
+      throw new Error('no recipient: pass `to` (a number or JID), or set WHATSAPP_GROUP_JID');
     }
+    const isDirect = target !== this.groupJid;
 
     const sendOpts = {};
     if (quoted?.id) {
       sendOpts.quoted = {
         key: {
-          remoteJid: this.groupJid,
+          remoteJid: target,
           fromMe: false,
           id: quoted.id,
           participant: quoted.senderJid || undefined,
@@ -737,16 +803,18 @@ export class WhatsAppClient extends EventEmitter {
     }
 
     const sent = await this.sock.sendMessage(
-      this.groupJid,
+      target,
       { text: body },
       sendOpts,
     );
     if (sent?.key?.id) this.sentByMe.add(sent.key.id);
+    // Remember 1:1 outreach peers so we capture their replies, and only theirs.
+    if (isDirect) this._addDirectPeer(target);
 
     const selfBare = this.sock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
     const out = {
       id: sent?.key?.id || `local-${Date.now()}`,
-      groupJid: this.groupJid,
+      groupJid: target,
       senderJid: selfBare,
       senderName: senderName || this.sock?.user?.name || 'me',
       body,

@@ -276,14 +276,14 @@ export class SessionManager extends EventEmitter {
     this.off('status', cb);
   }
 
-  async send({ userId, body, senderName, quoted }) {
+  async send({ userId, to, body, senderName, quoted }) {
     const client = this.clients.get(userId);
     if (!client) {
       const err = new Error('not paired');
       err.code = 'NOT_PAIRED';
       throw err;
     }
-    return client.sendText({ body, senderName, quoted });
+    return client.sendText({ to, body, senderName, quoted });
   }
 
   async sendReaction({ userId, messageId, originalSenderJid, emoji }) {
