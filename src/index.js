@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import multipart from '@fastify/multipart';
 import pino from 'pino';
 import qrcode from 'qrcode';
 import fs from 'node:fs';
@@ -23,6 +24,8 @@ const logger = pino({ level: LOG_LEVEL });
 const manager = new SessionManager({ logger, groupJid: GROUP_JID, primaryUserId: PRIMARY_USER_ID });
 
 const app = Fastify({ loggerInstance: logger });
+// Voice notes are POSTed as multipart; cap at 16 MB (well above a PTT clip).
+app.register(multipart, { limits: { fileSize: 16 * 1024 * 1024, files: 1 } });
 
 app.addHook('onRequest', async (req, reply) => {
   if (req.url === '/health') return;
@@ -139,6 +142,74 @@ app.post('/reactions', async (req, reply) => {
   }
 });
 
+// ---- presence / read receipts / edit / delete / voice -----------------------
+
+function viaUserId(req) {
+  const via = typeof req.body?.via === 'string' ? req.body.via : null;
+  return via || manager.primaryUserId;
+}
+
+function replyErr(reply, err) {
+  if (err.code === 'NOT_PAIRED') { reply.code(412).send({ error: err.message }); return; }
+  reply.code(503).send({ error: err.message });
+}
+
+app.post('/presence', async (req, reply) => {
+  const state = typeof req.body?.state === 'string' ? req.body.state : 'paused';
+  try {
+    return { ok: true, ...(await manager.sendPresence({ userId: viaUserId(req), state })) };
+  } catch (err) { replyErr(reply, err); }
+});
+
+app.post('/read', async (req, reply) => {
+  const messageIds = Array.isArray(req.body?.messageIds) ? req.body.messageIds : [];
+  try {
+    return { ok: true, ...(await manager.markRead({ userId: viaUserId(req), messageIds })) };
+  } catch (err) { replyErr(reply, err); }
+});
+
+app.post('/edit', async (req, reply) => {
+  const messageId = req.body?.messageId;
+  const body = req.body?.body;
+  if (typeof messageId !== 'string' || !messageId || typeof body !== 'string' || !body.trim()) {
+    reply.code(400).send({ error: 'messageId and non-empty body required' });
+    return;
+  }
+  try {
+    return { ok: true, ...(await manager.editText({ userId: viaUserId(req), messageId, body })) };
+  } catch (err) { replyErr(reply, err); }
+});
+
+app.post('/delete', async (req, reply) => {
+  const messageId = req.body?.messageId;
+  if (typeof messageId !== 'string' || !messageId) {
+    reply.code(400).send({ error: 'messageId required' });
+    return;
+  }
+  try {
+    return { ok: true, ...(await manager.deleteMessage({ userId: viaUserId(req), messageId })) };
+  } catch (err) { replyErr(reply, err); }
+});
+
+// Voice notes: multipart upload → sent as a PTT audio message. `via`/`to`/`ptt`
+// travel as multipart fields alongside the file part.
+app.post('/media/upload', async (req, reply) => {
+  let data;
+  try { data = await req.file(); } catch (err) { reply.code(400).send({ error: 'invalid upload' }); return; }
+  if (!data) { reply.code(400).send({ error: 'file required' }); return; }
+  const buffer = await data.toBuffer();
+  const fields = data.fields || {};
+  const fv = (k) => (fields[k] && typeof fields[k].value === 'string') ? fields[k].value : null;
+  const via = fv('via');
+  const to = fv('to');
+  const ptt = fv('ptt') !== 'false';
+  const userId = via || manager.primaryUserId;
+  try {
+    const sent = await manager.sendAudio({ userId, to, buffer, mimeType: data.mimetype, ptt });
+    return { ok: true, message: sent };
+  } catch (err) { replyErr(reply, err); }
+});
+
 app.get('/events', (req, reply) => {
   reply.raw.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -157,10 +228,19 @@ app.get('/events', (req, reply) => {
   const onMessage = (m) => write('message', m);
   const onReaction = (r) => write('reaction', r);
   const onStatus = () => write('status', manager.primaryStatus());
+  // Additive event types for presence/typing, read ticks, and edit/delete.
+  const onPresence = (p) => write('presence', p);
+  const onReceipt = (r) => write('receipt', r);
+  const onEdit = (e) => write('edit', e);
+  const onDelete = (d) => write('delete', d);
 
   manager.onMessage(onMessage);
   manager.onReaction(onReaction);
   manager.onStatus(onStatus);
+  manager.on('presence', onPresence);
+  manager.on('receipt', onReceipt);
+  manager.on('edit', onEdit);
+  manager.on('delete', onDelete);
 
   const ping = setInterval(() => reply.raw.write(': ping\n\n'), 25000);
 
@@ -169,6 +249,10 @@ app.get('/events', (req, reply) => {
     manager.offMessage(onMessage);
     manager.offReaction(onReaction);
     manager.offStatus(onStatus);
+    manager.off('presence', onPresence);
+    manager.off('receipt', onReceipt);
+    manager.off('edit', onEdit);
+    manager.off('delete', onDelete);
   });
 });
 

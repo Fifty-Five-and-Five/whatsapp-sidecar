@@ -128,14 +128,13 @@ export class SessionManager extends EventEmitter {
     // the primary anyway.
     if (mode === 'primary') {
       const forward = (event) => (payload) => this.emit(event, payload);
-      const onMessage = forward('message');
-      const onReaction = forward('reaction');
-      const onStatus = forward('status');
-      client.on('message', onMessage);
-      client.on('reaction', onReaction);
-      client.on('status', onStatus);
+      const f = {};
+      for (const ev of ['message', 'reaction', 'status', 'presence', 'receipt', 'edit', 'delete']) {
+        f[ev] = forward(ev);
+        client.on(ev, f[ev]);
+      }
       // Snapshot so we can detach if this same userId is re-paired later.
-      client._managerForwarders = { onMessage, onReaction, onStatus };
+      client._managerForwarders = f;
     }
     this.clients.set(userId, client);
     await client.start();
@@ -211,9 +210,7 @@ export class SessionManager extends EventEmitter {
     if (client) {
       const fwd = client._managerForwarders;
       if (fwd) {
-        client.off('message', fwd.onMessage);
-        client.off('reaction', fwd.onReaction);
-        client.off('status', fwd.onStatus);
+        for (const ev of Object.keys(fwd)) client.off(ev, fwd[ev]);
       }
       await client.stop();
       this.clients.delete(userId);
@@ -287,13 +284,7 @@ export class SessionManager extends EventEmitter {
   }
 
   async sendReaction({ userId, messageId, originalSenderJid, emoji }) {
-    const client = this.clients.get(userId);
-    if (!client) {
-      const err = new Error('not paired');
-      err.code = 'NOT_PAIRED';
-      throw err;
-    }
-    return client.sendReaction({ messageId, originalSenderJid, emoji });
+    return this._req(userId).sendReaction({ messageId, originalSenderJid, emoji });
   }
 
   onReaction(cb) {
@@ -302,5 +293,35 @@ export class SessionManager extends EventEmitter {
 
   offReaction(cb) {
     this.off('reaction', cb);
+  }
+
+  _req(userId) {
+    const client = this.clients.get(userId);
+    if (!client) {
+      const err = new Error('not paired');
+      err.code = 'NOT_PAIRED';
+      throw err;
+    }
+    return client;
+  }
+
+  async sendPresence({ userId, state }) {
+    return this._req(userId).sendPresence(state);
+  }
+
+  async markRead({ userId, messageIds }) {
+    return this._req(userId).markRead(messageIds);
+  }
+
+  async editText({ userId, messageId, body }) {
+    return this._req(userId).editText({ messageId, body });
+  }
+
+  async deleteMessage({ userId, messageId }) {
+    return this._req(userId).deleteMessage({ messageId });
+  }
+
+  async sendAudio({ userId, to, buffer, mimeType, ptt }) {
+    return this._req(userId).sendAudio({ to, buffer, mimeType, ptt });
   }
 }

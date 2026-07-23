@@ -217,6 +217,11 @@ export class WhatsAppClient extends EventEmitter {
           }
         }
       });
+      // Presence (online / typing), read-receipt ticks, and edit/delete of our
+      // own or others' messages. All additive — they only emit new event types.
+      sock.ev.on('presence.update', (u) => this._onPresence(u));
+      sock.ev.on('message-receipt.update', (u) => this._onReceipts(u));
+      sock.ev.on('messages.update', (u) => this._onMessageUpdates(u));
     } else {
       // sender-only sessions still need messages.upsert to track sentByMe so
       // they can detect their own outgoing echoes (used for status feedback),
@@ -268,6 +273,16 @@ export class WhatsAppClient extends EventEmitter {
         this._primeGroupCache().catch((err) =>
           this.logger.warn({ err }, 'group cache prime failed'),
         );
+        // Subscribe to the pinned group's presence so we receive online/typing
+        // updates for its participants.
+        if (this.groupJid) {
+          try {
+            const r = this.sock.presenceSubscribe(this.groupJid);
+            if (r && typeof r.catch === 'function') r.catch(() => {});
+          } catch (err) {
+            this.logger.warn({ err }, 'presenceSubscribe failed');
+          }
+        }
       }
     }
     if (connection === 'close') {
@@ -368,7 +383,21 @@ export class WhatsAppClient extends EventEmitter {
 
   _processMessage(msg, { emit }) {
     if (!msg?.message) return false;
-    if (msg.message.protocolMessage) return false;
+    if (msg.message.protocolMessage) {
+      // Inbound delete-for-everyone (REVOKE=0) and message edit (MESSAGE_EDIT=14)
+      // arrive as protocol messages. Surface them so the live UI updates; never
+      // record the protocol envelope itself.
+      const pm = msg.message.protocolMessage;
+      const t = pm?.type;
+      if ((t === 0 || t === 'REVOKE') && pm.key?.id) {
+        this._applyDelete(pm.key.id, { emit });
+      } else if ((t === 14 || t === 'MESSAGE_EDIT') && pm.key?.id && pm.editedMessage) {
+        const em = pm.editedMessage;
+        const newText = em.conversation || em.extendedTextMessage?.text || em.imageMessage?.caption || em.videoMessage?.caption || '';
+        this._applyEdit(pm.key.id, newText, { emit });
+      }
+      return false;
+    }
     if (!msg.key) return false;
     if (msg.message.reactionMessage) {
       this._processReaction(msg, { emit });
@@ -494,6 +523,70 @@ export class WhatsAppClient extends EventEmitter {
       timestamp: new Date(ts).toISOString(),
     };
     if (emit) this.emit('reaction', out);
+  }
+
+  // Presence updates (online / typing) for the pinned group's participants.
+  _onPresence(u) {
+    if (!u || u.id == null) return;
+    if (this.groupJid && u.id !== this.groupJid && !u.id.endsWith('@s.whatsapp.net')) return;
+    const presences = u.presences || {};
+    for (const [jid, p] of Object.entries(presences)) {
+      const lk = p && p.lastKnownPresence || null;
+      this.emit('presence', {
+        groupJid: u.id,
+        jid,
+        senderName: this._resolveName(jid, null),
+        presence: lk,
+        typing: lk === 'composing' || lk === 'recording',
+        ts: new Date().toISOString(),
+      });
+    }
+  }
+
+  // Delivery/read ticks for OUR OWN sent messages (from explicit receipts).
+  _onReceipts(updates) {
+    if (!Array.isArray(updates)) return;
+    for (const u of updates) {
+      const key = u.key || {};
+      if (!key.fromMe) continue;
+      if (this.groupJid && key.remoteJid !== this.groupJid) continue;
+      const r = u.receipt || {};
+      const status = r.readTimestamp ? 'read' : (r.receiptTimestamp || r.deliveryTimestamp ? 'delivered' : null);
+      if (!status || !key.id) continue;
+      this.emit('receipt', { messageId: key.id, status, userJid: r.userJid || null, ts: new Date().toISOString() });
+    }
+  }
+
+  // messages.update carries the numeric status enum on our sent messages
+  // (SERVER_ACK=2, DELIVERY_ACK=3, READ=4, PLAYED=5) plus null-message revokes.
+  _onMessageUpdates(updates) {
+    if (!Array.isArray(updates)) return;
+    for (const u of updates) {
+      const key = u.key || {};
+      if (this.groupJid && key.remoteJid !== this.groupJid) continue;
+      const upd = u.update || {};
+      if (key.fromMe && typeof upd.status === 'number') {
+        const status = upd.status >= 4 ? 'read' : upd.status === 3 ? 'delivered' : null;
+        if (status && key.id) this.emit('receipt', { messageId: key.id, status, ts: new Date().toISOString() });
+      }
+      if ((upd.message === null || upd.messageStubType === 1) && key.id) {
+        this._applyDelete(key.id, { emit: true });
+      }
+    }
+  }
+
+  _applyDelete(id, { emit }) {
+    if (!id) return;
+    const m = this.recent.find((x) => x.id === id);
+    if (m && !m.deleted) { m.deleted = true; m.body = ''; m.media = null; this._scheduleBufferFlush(); }
+    if (emit) this.emit('delete', { messageId: id, ts: new Date().toISOString() });
+  }
+
+  _applyEdit(id, body, { emit }) {
+    if (!id) return;
+    const m = this.recent.find((x) => x.id === id);
+    if (m) { m.body = body || ''; m.edited = true; this._scheduleBufferFlush(); }
+    if (emit) this.emit('edit', { messageId: id, body: body || '', ts: new Date().toISOString() });
   }
 
   async sendReaction({ messageId, originalSenderJid, emoji }) {
@@ -830,6 +923,94 @@ export class WhatsAppClient extends EventEmitter {
         : null,
     };
     this._recordMessage(out);
+    this.emit('message', out);
+    return out;
+  }
+
+  // ---- presence / receipts / edit / delete / audio -----------------------
+
+  async sendPresence(stateArg) {
+    if (this.status !== 'connected') throw new Error(`not connected (status=${this.status})`);
+    const target = this.groupJid;
+    if (!target) throw new Error('WHATSAPP_GROUP_JID is not configured');
+    const s = ['composing', 'recording', 'paused', 'available', 'unavailable'].includes(stateArg) ? stateArg : 'paused';
+    await this.sock.sendPresenceUpdate(s, target);
+    return { ok: true, state: s };
+  }
+
+  async markRead(messageIds) {
+    if (this.status !== 'connected') throw new Error(`not connected (status=${this.status})`);
+    const ids = Array.isArray(messageIds) ? messageIds.filter(Boolean) : [];
+    if (!ids.length) return { ok: true, read: 0 };
+    const keys = ids.map((id) => {
+      const m = this.recent.find((x) => x.id === id);
+      return {
+        remoteJid: this.groupJid || (m && m.groupJid) || null,
+        id,
+        fromMe: false,
+        participant: m && m.senderJid ? m.senderJid : undefined,
+      };
+    }).filter((k) => k.remoteJid && k.id);
+    if (keys.length) await this.sock.readMessages(keys);
+    return { ok: true, read: keys.length };
+  }
+
+  async editText({ messageId, body }) {
+    if (this.status !== 'connected') throw new Error(`not connected (status=${this.status})`);
+    const target = this.groupJid;
+    if (!target) throw new Error('WHATSAPP_GROUP_JID is not configured');
+    if (!messageId || typeof body !== 'string' || !body.trim()) throw new Error('messageId and non-empty body required');
+    const key = { remoteJid: target, fromMe: true, id: messageId };
+    await this.sock.sendMessage(target, { text: body, edit: key });
+    this._applyEdit(messageId, body, { emit: true });
+    return { ok: true, messageId };
+  }
+
+  async deleteMessage({ messageId }) {
+    if (this.status !== 'connected') throw new Error(`not connected (status=${this.status})`);
+    const target = this.groupJid;
+    if (!target) throw new Error('WHATSAPP_GROUP_JID is not configured');
+    if (!messageId) throw new Error('messageId required');
+    const key = { remoteJid: target, fromMe: true, id: messageId };
+    await this.sock.sendMessage(target, { delete: key });
+    this._applyDelete(messageId, { emit: true });
+    return { ok: true, messageId };
+  }
+
+  async sendAudio({ to, buffer, mimeType, ptt }) {
+    if (this.status !== 'connected') throw new Error(`not connected (status=${this.status})`);
+    if (!buffer || !buffer.length) throw new Error('empty audio');
+    const target = toJid(to) || this.groupJid;
+    if (!target) throw new Error('no recipient: pass `to`, or set WHATSAPP_GROUP_JID');
+    const mime = mimeType || 'audio/ogg; codecs=opus';
+    const sent = await this.sock.sendMessage(target, { audio: buffer, ptt: ptt !== false, mimetype: mime });
+    if (sent?.key?.id) this.sentByMe.add(sent.key.id);
+    if (target !== this.groupJid) this._addDirectPeer(target);
+
+    const selfBare = this.sock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
+    const id = sent?.key?.id || `local-${Date.now()}`;
+    const out = {
+      id,
+      groupJid: target,
+      senderJid: selfBare,
+      senderName: this.sock?.user?.name || 'me',
+      body: '',
+      direction: 'out',
+      timestamp: new Date().toISOString(),
+      media: { type: 'audio', mime, size: buffer.length, width: null, height: null },
+      quoted: null,
+    };
+    this._recordMessage(out);
+    // Persist locally so /media/:id can serve it back for in-panel playback.
+    try {
+      const ext = mimeToExt(mime);
+      const tmp = path.join(MEDIA_DIR, `${id}.${ext}.tmp`);
+      const dst = path.join(MEDIA_DIR, `${id}.${ext}`);
+      await fs.writeFile(tmp, buffer);
+      await fs.rename(tmp, dst);
+    } catch (err) {
+      this.logger.warn({ err, id }, 'failed to persist sent audio');
+    }
     this.emit('message', out);
     return out;
   }
