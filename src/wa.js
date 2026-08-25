@@ -715,6 +715,33 @@ export class WhatsAppClient extends EventEmitter {
     this._scheduleDirectPeersFlush();
   }
 
+  /**
+   * Replace the direct-peer allow-set with an externally-owned list.
+   *
+   * The set otherwise grows only from sendText, which means a thread is captured
+   * only if its first message went out through this API. Message someone from
+   * the phone, as anyone actually would, and their replies are never seen.
+   *
+   * The Earl CRM pushes the phone numbers it holds on contact records here, so
+   * the allow-set becomes "people the business has deliberately recorded"
+   * rather than "people we happened to message through the bridge". Numbers
+   * arrive E.164 and are converted to JIDs.
+   *
+   * Deliberately a REPLACE, not a merge: removing someone from the CRM has to
+   * actually revoke capture. A merge would make the set grow-only, so "delete
+   * the contact" would quietly not mean "stop reading their messages".
+   */
+  setDirectPeers(numbers) {
+    const next = new Set();
+    for (const raw of numbers || []) {
+      const digits = String(raw).replace(/[^\d]/g, '');
+      if (digits.length >= 7 && digits.length <= 15) next.add(`${digits}@s.whatsapp.net`);
+    }
+    this.directPeers = next;
+    this._scheduleDirectPeersFlush();
+    return next.size;
+  }
+
   async _flushDirectPeers() {
     const tmp = `${DIRECT_PEERS_PATH}.tmp`;
     await fs.writeFile(tmp, JSON.stringify([...this.directPeers]), 'utf-8');

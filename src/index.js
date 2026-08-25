@@ -56,6 +56,28 @@ app.get('/messages', async (req) => {
   return { messages: manager.recentMessages({ sinceIso: since, limit }) };
 });
 
+// Replace the 1:1 capture allow-set. The Earl CRM owns this list and pushes the
+// phone numbers it holds on contact records, so what the sidecar records is
+// "people the business has deliberately recorded" rather than "people we
+// happened to message through this API". A number absent from the list is never
+// buffered at all, which is where the consent boundary belongs.
+//
+// Primary session only: the secondaries are sender-only and never record, so
+// they have no allow-set to set.
+app.put('/peers', async (req, reply) => {
+  const numbers = req.body?.numbers;
+  if (!Array.isArray(numbers)) {
+    reply.code(400).send({ error: 'numbers must be an array of phone numbers' });
+    return;
+  }
+  const client = manager.primary();
+  if (!client) {
+    reply.code(503).send({ error: 'primary session not running' });
+    return;
+  }
+  return { count: client.setDirectPeers(numbers) };
+});
+
 app.post('/messages', async (req, reply) => {
   const body = req.body?.body;
   // `to` (phone number or JID) sends a 1:1 message; omit it to post to the group.
