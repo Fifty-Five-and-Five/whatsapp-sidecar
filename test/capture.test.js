@@ -296,3 +296,70 @@ test('a group is never mistaken for a 1:1 by the lid path', async () => {
   assert.equal(secondary._processMessage(m, { emit: false }), false);
   await Promise.all([c._settleWrites(), secondary._settleWrites()]);
 });
+
+test('the allow-set numbers are looked up so a one-way chat is still recognised', async () => {
+  // The case the reactive sources miss: the CRM has just been given a mobile,
+  // we message them first, and their chat arrives @lid-addressed carrying our
+  // own number rather than theirs.
+  const c = client();
+  const asked = [];
+  c.status = 'connected';
+  c.sock = {
+    ...c.sock,
+    onWhatsApp: async (...jids) => {
+      asked.push(...jids);
+      return [{ jid: CONTACT, exists: true, lid: CONTACT_LID }];
+    },
+  };
+
+  c.setDirectPeers(['+447700900123']);
+  await c._resolveLidsForPeers();
+
+  assert.deepEqual([...new Set(asked)], [CONTACT]);
+  assert.equal(c._pnFor(CONTACT_LID), CONTACT);
+  assert.equal(c._processMessage(message({ from: CONTACT_LID, id: 'oneway', fromMe: true }), { emit: false }), true);
+  await c._settleWrites();
+});
+
+test('only allow-set numbers are ever looked up', async () => {
+  const c = client();
+  const asked = [];
+  c.status = 'connected';
+  c.sock = { ...c.sock, onWhatsApp: async (...jids) => { asked.push(...jids); return []; } };
+
+  c.setDirectPeers(['+447700900123']);
+  await c._resolveLidsForPeers();
+  assert.deepEqual(
+    [...new Set(asked)],
+    [CONTACT],
+    'the lookup must not reach beyond the recorded numbers',
+  );
+  await c._settleWrites();
+});
+
+test('a number we already know is not looked up again', async () => {
+  const c = client();
+  let calls = 0;
+  c.status = 'connected';
+  c.sock = { ...c.sock, onWhatsApp: async () => { calls++; return [{ jid: CONTACT, exists: true, lid: CONTACT_LID }]; } };
+
+  c.setDirectPeers(['+447700900123']);
+  await c._resolveLidsForPeers();
+  assert.equal(c._pnFor(CONTACT_LID), CONTACT);
+
+  // setDirectPeers fires its own lookup, so count only what follows.
+  calls = 0;
+  await c._resolveLidsForPeers();
+  assert.equal(calls, 0, 'a number whose lid we already hold is not asked about again');
+  await c._settleWrites();
+});
+
+test('a failed lookup is survivable, not fatal', async () => {
+  const c = client();
+  c.status = 'connected';
+  c.sock = { ...c.sock, onWhatsApp: async () => { throw new Error('usync timeout'); } };
+  c.setDirectPeers(['+447700900123']);
+  await c._resolveLidsForPeers();  // must not throw
+  assert.equal(c.lidToPn.size, 0);
+  await c._settleWrites();
+});

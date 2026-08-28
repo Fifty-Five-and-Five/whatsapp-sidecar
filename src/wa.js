@@ -307,6 +307,11 @@ export class WhatsAppClient extends EventEmitter {
           this.logger.warn({ err }, 'group cache prime failed'),
         );
       }
+      // The allow-set is loaded from disk before the socket opens, so this is
+      // the first moment we can ask WhatsApp about it.
+      this._resolveLidsForPeers().catch((err) =>
+        this.logger.warn({ err }, 'lid resolution on connect failed'),
+      );
     }
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
@@ -353,6 +358,44 @@ export class WhatsAppClient extends EventEmitter {
     if (this.lidToPn.get(bareLid) === barePn) return;
     this.lidToPn.set(bareLid, barePn);
     this._scheduleLidMapFlush();
+  }
+
+  /**
+   * Ask WhatsApp for the anonymous id behind each allow-set number.
+   *
+   * The other two sources are reactive: a peer's number arrives on their first
+   * inbound message, or in a contacts sync, which only lands in full on a fresh
+   * pair. Neither covers the case that matters most — a conversation we start,
+   * with a contact whose number the CRM has just been given — so without this a
+   * new number can sit unrecognised for as long as the chat stays one-way.
+   *
+   * Only numbers already on the allow-set are looked up, which is to say only
+   * numbers someone has deliberately put on a CRM record.
+   */
+  async _resolveLidsForPeers() {
+    if (this.status !== 'connected' || !this.sock) return;
+    const wanted = [...this.directPeers].filter((jid) => !this._lidFor(jid));
+    if (!wanted.length) return;
+    for (let i = 0; i < wanted.length; i += 50) {
+      const batch = wanted.slice(i, i + 50);
+      try {
+        const results = (await this.sock.onWhatsApp(...batch)) || [];
+        for (const r of results) this._learnLid(r?.lid, r?.jid);
+      } catch (err) {
+        this.logger.warn({ err, count: batch.length }, 'lid lookup failed');
+      }
+    }
+    this.logger.info(
+      { asked: wanted.length, known: this.lidToPn.size },
+      'resolved anonymous ids for allow-set numbers',
+    );
+  }
+
+  /** The anonymous id we hold for a phone JID, if any. */
+  _lidFor(pn) {
+    const bare = pn?.split(':')[0].split('@')[0] + '@s.whatsapp.net';
+    for (const [lid, mapped] of this.lidToPn) if (mapped === bare) return lid;
+    return null;
   }
 
   /** The phone-number JID behind a chat id, or null if we cannot tell. */
@@ -886,6 +929,12 @@ export class WhatsAppClient extends EventEmitter {
     // deserves a fresh refusal line if it turns up again.
     this.refusedJids.clear();
     this._scheduleDirectPeersFlush();
+    // A new number is useless to us until we can recognise its chat in either
+    // addressing form, and the CRM pushes this list the moment someone saves a
+    // mobile. Fire and forget: a lookup that fails is retried on the next push.
+    this._resolveLidsForPeers().catch((err) =>
+      this.logger.warn({ err }, 'lid resolution after peer push failed'),
+    );
     return next.size;
   }
 
