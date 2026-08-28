@@ -62,8 +62,8 @@ app.get('/messages', async (req) => {
 // happened to message through this API". A number absent from the list is never
 // buffered at all, which is where the consent boundary belongs.
 //
-// Primary session only: the secondaries are sender-only and never record, so
-// they have no allow-set to set.
+// This is the primary's allow-set. Each session has its own — see
+// PUT /sessions/:userId/peers.
 app.put('/peers', async (req, reply) => {
   const numbers = req.body?.numbers;
   if (!Array.isArray(numbers)) {
@@ -220,6 +220,40 @@ app.get('/sessions/:userId/qr', async (req, reply) => {
   }
   const png = await qrcode.toBuffer(qr, { type: 'png', width: 360 });
   reply.header('content-type', 'image/png').send(png);
+});
+
+// One session's own 1:1 allow-set. The CRM pushes here per paired director, and
+// pushes it at the moment the session is created rather than waiting for the
+// next sync run: WhatsApp delivers the phone's history within seconds of a
+// pair, the gate is applied as each message arrives, and a refused message is
+// gone for good.
+app.put('/sessions/:userId/peers', async (req, reply) => {
+  const numbers = req.body?.numbers;
+  if (!Array.isArray(numbers)) {
+    reply.code(400).send({ error: 'numbers must be an array of phone numbers' });
+    return;
+  }
+  try {
+    return { count: manager.setPeersFor(req.params.userId, numbers) };
+  } catch (err) {
+    reply.code(err.code === 'NOT_PAIRED' ? 412 : 503).send({ error: err.message });
+  }
+});
+
+// One session's own messages. `direct=1` drops the group, which is what the CRM
+// wants: group chatter is not relationship history and its members appear as
+// opaque privacy ids with no phone number to resolve against.
+app.get('/sessions/:userId/messages', async (req, reply) => {
+  const since = typeof req.query.since === 'string' ? req.query.since : null;
+  const limit = req.query.limit ? Number(req.query.limit) : undefined;
+  const directOnly = req.query.direct === '1' || req.query.direct === 'true';
+  try {
+    return {
+      messages: manager.messagesFor(req.params.userId, { sinceIso: since, limit, directOnly }),
+    };
+  } catch (err) {
+    reply.code(err.code === 'NOT_PAIRED' ? 412 : 503).send({ error: err.message });
+  }
 });
 
 app.post('/sessions/:userId', async (req, reply) => {
