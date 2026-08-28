@@ -3,6 +3,9 @@ name: Build and push image
 on:
   push:
     branches: [main]
+  # Tests run on pull requests too, or the gate only catches a problem once it
+  # is already on main. The build stays off PRs so they don't publish images.
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -27,6 +30,7 @@ jobs:
 
   build:
     needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
