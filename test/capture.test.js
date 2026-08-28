@@ -209,3 +209,90 @@ test('a manager reports a session it does not have rather than guessing', () => 
   assert.throws(() => mgr.setPeersFor('nobody', ['+447700900123']), /not paired/);
   assert.throws(() => mgr.messagesFor('nobody', {}), /not paired/);
 });
+
+
+// --- anonymous @lid addressing --------------------------------------------
+//
+// WhatsApp is moving 1:1 chats onto anonymous ids: a conversation that used to
+// arrive as 447700900123@s.whatsapp.net now arrives as 8012345678901@lid. The
+// gate only understood the phone form, so from late June 2026 every 1:1 was
+// dropped in silence while group capture carried on working.
+
+const CONTACT_LID = '8012345678901@lid';
+
+test('a 1:1 addressed by @lid is refused while its number is unknown', async () => {
+  const c = client();
+  c.setDirectPeers(['+447700900123']);
+  assert.equal(c._processMessage(message({ from: CONTACT_LID }), { emit: false }), false);
+  assert.equal(c.recent.length, 0, 'guessing whose lid this is would be a wrong-person match');
+  await c._settleWrites();
+});
+
+test('an inbound @lid message teaches us the number, and is captured', async () => {
+  const c = client();
+  c.setDirectPeers(['+447700900123']);
+  const m = message({ from: CONTACT_LID, id: 'lid-in' });
+  m.key.senderPn = CONTACT;  // Baileys hands us the phone form alongside the lid
+
+  assert.equal(c._processMessage(m, { emit: false }), true);
+  assert.equal(c.recent[0].groupJid, CONTACT, 'stored in phone form, so the CRM can resolve it');
+  assert.equal(c.recent[0].senderJid, CONTACT);
+  await c._settleWrites();
+});
+
+test('a contact carrying both ids teaches us the number before they write', async () => {
+  // The case that matters for outreach: we message someone first, so the chat
+  // exists with nothing inbound in it. An outbound message carries our own
+  // number, not theirs, so the contacts sync is the only thing that can name
+  // the peer.
+  const c = client();
+  c.setDirectPeers(['+447700900123']);
+  c._onContacts([{ id: CONTACT_LID, lid: CONTACT_LID, jid: CONTACT, name: 'A Contact' }]);
+
+  const m = message({ from: CONTACT_LID, id: 'lid-out', fromMe: true });
+  assert.equal(c._processMessage(m, { emit: false }), true);
+  assert.equal(c.recent[0].groupJid, CONTACT);
+  assert.equal(c.recent[0].direction, 'out');
+  await c._settleWrites();
+});
+
+test('a lid we have learned survives a restart', async () => {
+  const dir = path.join(ROOT, 'users', 'lidrestart');
+  await fs.mkdir(dir, { recursive: true });
+  const first = client({ mode: 'secondary', storeDir: dir });
+  first._onContacts([{ id: CONTACT_LID, lid: CONTACT_LID, jid: CONTACT }]);
+  await first._settleWrites();
+
+  const second = client({ mode: 'secondary', storeDir: dir });
+  await second._loadLidMap();
+  assert.equal(second._pnFor(CONTACT_LID), CONTACT);
+});
+
+test('a device suffix on either form still maps', async () => {
+  const c = client();
+  c._onContacts([{ id: '8012345678901:7@lid', lid: '8012345678901:7@lid', jid: '447700900123:24@s.whatsapp.net' }]);
+  assert.equal(c._pnFor(CONTACT_LID), CONTACT);
+  await c._settleWrites();
+});
+
+test('a group message still teaches us its participants', async () => {
+  const c = client();
+  const m = message({ from: GROUP, id: 'g-lid' });
+  m.key.participantLid = CONTACT_LID;
+  m.key.participantPn = CONTACT;
+  c._processMessage(m, { emit: false });
+  assert.equal(c._pnFor(CONTACT_LID), CONTACT);
+  await c._settleWrites();
+});
+
+test('a group is never mistaken for a 1:1 by the lid path', async () => {
+  const c = client();
+  c.setDirectPeers(['+447700900123']);
+  const secondary = client({ mode: 'secondary', storeDir: path.join(ROOT, 'users', 'lidgroup') });
+  secondary.setDirectPeers(['+447700900123']);
+  const m = message({ from: GROUP, id: 'g-not-direct' });
+  m.key.participantLid = CONTACT_LID;
+  m.key.participantPn = CONTACT;
+  assert.equal(secondary._processMessage(m, { emit: false }), false);
+  await Promise.all([c._settleWrites(), secondary._settleWrites()]);
+});

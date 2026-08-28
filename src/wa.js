@@ -167,6 +167,14 @@ export class WhatsAppClient extends EventEmitter {
     this.anchorPath = path.join(this.storeDir, 'anchor.json');
     this.contactsPath = path.join(this.storeDir, 'contacts.json');
     this.directPeersPath = path.join(this.storeDir, 'direct-peers.json');
+    this.lidMapPath = path.join(this.storeDir, 'lid-map.json');
+    // WhatsApp is migrating 1:1 chats onto anonymous "@lid" addressing, so a
+    // conversation that used to arrive as 447700900123@s.whatsapp.net now
+    // arrives as 8012345678901@lid with no phone number in sight. Everything
+    // downstream — the allow-set, the CRM's resolver — is keyed on the number,
+    // so we keep our own map and translate at the door.
+    this.lidToPn = new Map();
+    this.lidMapFlushTimer = null;
     // Jids we have already logged a refusal for, so a chatty non-contact
     // doesn't fill the log. See _processMessage.
     this.refusedJids = new Set();
@@ -202,6 +210,7 @@ export class WhatsAppClient extends EventEmitter {
     await this._loadBuffer();
     await this._loadContacts();
     await this._loadDirectPeers();
+    await this._loadLidMap();
     await this._loadAnchor();
     const { state, saveCreds } = await useMultiFileAuthState(this.baileysDir);
     const { version } = await fetchLatestBaileysVersion();
@@ -245,7 +254,7 @@ export class WhatsAppClient extends EventEmitter {
    *  Without this a SIGTERM inside the 1.5s debounce window loses whatever
    *  arrived in it, and a timer fires against a stopped client. */
   async _settleWrites() {
-    for (const key of ['bufferFlushTimer', '_anchorFlushTimer', 'contactsFlushTimer', 'directPeersFlushTimer']) {
+    for (const key of ['bufferFlushTimer', '_anchorFlushTimer', 'contactsFlushTimer', 'directPeersFlushTimer', 'lidMapFlushTimer']) {
       if (this[key]) {
         clearTimeout(this[key]);
         this[key] = null;
@@ -256,6 +265,7 @@ export class WhatsAppClient extends EventEmitter {
       this._flushAnchor(),
       this._flushContacts(),
       this._flushDirectPeers(),
+      this._flushLidMap(),
     ]);
   }
 
@@ -324,8 +334,33 @@ export class WhatsAppClient extends EventEmitter {
         this.contacts.set(c.id, name);
         changed = true;
       }
+      // A contact carries both forms of its id when WhatsApp knows both. This
+      // is the only source that teaches us a peer's number BEFORE they have
+      // sent us anything, which matters because a chat we start ourselves
+      // arrives back @lid-addressed with only our own number attached.
+      this._learnLid(c.lid, c.jid);
+      if (c.id?.endsWith('@lid')) this._learnLid(c.id, c.jid);
+      if (c.id?.endsWith('@s.whatsapp.net')) this._learnLid(c.lid, c.id);
     }
     if (changed) this._scheduleContactsFlush();
+  }
+
+  /** Remember that an anonymous @lid id belongs to a phone number. */
+  _learnLid(lid, pn) {
+    if (!lid?.endsWith('@lid') || !pn?.endsWith('@s.whatsapp.net')) return;
+    const bareLid = lid.split(':')[0].split('@')[0] + '@lid';
+    const barePn = pn.split(':')[0].split('@')[0] + '@s.whatsapp.net';
+    if (this.lidToPn.get(bareLid) === barePn) return;
+    this.lidToPn.set(bareLid, barePn);
+    this._scheduleLidMapFlush();
+  }
+
+  /** The phone-number JID behind a chat id, or null if we cannot tell. */
+  _pnFor(jid) {
+    if (!jid) return null;
+    if (jid.endsWith('@s.whatsapp.net')) return jid.split(':')[0].split('@')[0] + '@s.whatsapp.net';
+    if (!jid.endsWith('@lid')) return null;
+    return this.lidToPn.get(jid.split(':')[0].split('@')[0] + '@lid') || null;
   }
 
   async _primeGroupCache() {
@@ -404,8 +439,17 @@ export class WhatsAppClient extends EventEmitter {
     }
 
     const jid = msg.key.remoteJid;
+    // The counterparty's phone-number JID for a 1:1, filled in below. Everything
+    // downstream is keyed on the number, never on the anonymous id.
+    let peerPn = null;
     const isGroup = jid?.endsWith('@g.us');
-    const isDirect = jid?.endsWith('@s.whatsapp.net');
+    // A 1:1 chat now arrives addressed either way. Baileys hands us the peer's
+    // number alongside the anonymous id on inbound messages, so learn from
+    // every one that passes: an outbound-only chat has no sender_pn of the
+    // peer's and would otherwise never be identifiable.
+    const isDirect = jid?.endsWith('@s.whatsapp.net') || jid?.endsWith('@lid');
+    if (isDirect && !msg.key.fromMe) this._learnLid(jid, msg.key.senderPn);
+    if (isGroup) this._learnLid(msg.key.participantLid, msg.key.participantPn);
 
     // Our own echo of a message this session just sent. Cleared here, above the
     // jid gates, so a send to a number outside the allow-set still retires its
@@ -433,14 +477,30 @@ export class WhatsAppClient extends EventEmitter {
       // Only capture 1:1 chats with numbers on the allow-set the CRM pushes.
       // Everything else — the owner's personal DMs — is ignored, so the sidecar
       // never ingests unrelated private conversations.
-      if (!this.directPeers.has(jid)) {
-        // Say so, once per counterparty. Silently dropping made "no message
-        // arrived" and "a message arrived and was refused" look identical from
-        // outside, which is not a distinction anyone should have to guess at.
+      //
+      // The allow-set is phone numbers, so an @lid chat has to be translated
+      // first. A lid we cannot translate is refused, and says so: guessing
+      // which contact an anonymous id belongs to is exactly the wrong-person
+      // match everything downstream is built to avoid.
+      peerPn = this._pnFor(jid);
+      if (!peerPn) {
         if (!this.refusedJids.has(jid)) {
           this.refusedJids.add(jid);
           this.logger.info(
-            { jid, peers: this.directPeers.size },
+            { jid, knownLids: this.lidToPn.size },
+            'refused 1:1 message: no phone number known for this @lid id',
+          );
+        }
+        return false;
+      }
+      if (!this.directPeers.has(peerPn)) {
+        // Say so, once per counterparty. Silently dropping made "no message
+        // arrived" and "a message arrived and was refused" look identical from
+        // outside, which is not a distinction anyone should have to guess at.
+        if (!this.refusedJids.has(peerPn)) {
+          this.refusedJids.add(peerPn);
+          this.logger.info(
+            { jid, peerPn, peers: this.directPeers.size },
             'refused 1:1 message: counterparty is not on the allow-set',
           );
         }
@@ -457,7 +517,13 @@ export class WhatsAppClient extends EventEmitter {
 
     const fromMe = !!msg.key.fromMe;
     const selfBare = this.sock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
-    const senderJid = fromMe ? selfBare : msg.key.participant || jid;
+    // Store the phone form throughout, whichever form it arrived in. Consumers
+    // read the chat id to work out who the conversation is with, and an
+    // anonymous id names nobody.
+    const chatJid = peerPn || jid;
+    const senderJid = fromMe
+      ? selfBare
+      : peerPn || msg.key.participant || jid;
 
     if (msg.key.id && this.recentIndex.has(msg.key.id)) return false;
 
@@ -479,7 +545,7 @@ export class WhatsAppClient extends EventEmitter {
 
     const out = {
       id: msg.key.id,
-      groupJid: jid,
+      groupJid: chatJid,
       senderJid,
       senderName,
       body: text || '',
@@ -746,6 +812,37 @@ export class WhatsAppClient extends EventEmitter {
     }
   }
 
+  _scheduleLidMapFlush() {
+    if (this.lidMapFlushTimer) return;
+    this.lidMapFlushTimer = setTimeout(() => {
+      this.lidMapFlushTimer = null;
+      this._flushLidMap().catch((err) =>
+        this.logger.warn({ err }, 'lid map flush failed'),
+      );
+    }, BUFFER_FLUSH_DEBOUNCE_MS);
+  }
+
+  async _flushLidMap() {
+    const tmp = `${this.lidMapPath}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(Object.fromEntries(this.lidToPn)), 'utf-8');
+    await fs.rename(tmp, this.lidMapPath);
+  }
+
+  async _loadLidMap() {
+    try {
+      const raw = await fs.readFile(this.lidMapPath, 'utf-8');
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') {
+        for (const [k, v] of Object.entries(obj)) this.lidToPn.set(k, v);
+        this.logger.info({ count: this.lidToPn.size }, 'lid map loaded from disk');
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        this.logger.warn({ err }, 'failed to load lid map');
+      }
+    }
+  }
+
   _scheduleDirectPeersFlush() {
     if (this.directPeersFlushTimer) return;
     this.directPeersFlushTimer = setTimeout(() => {
@@ -851,6 +948,9 @@ export class WhatsAppClient extends EventEmitter {
       // worth being able to see.
       peers: this.directPeers.size,
       buffered: this.recent.length,
+      // How many anonymous @lid ids we can put a number to. A 1:1 whose id we
+      // cannot translate is refused, so this being zero explains a silent feed.
+      knownLids: this.lidToPn.size,
     };
   }
 

@@ -29,6 +29,8 @@ const SHARED_TOP_LEVEL = new Set([
   'contacts.json.tmp',
   'direct-peers.json',
   'direct-peers.json.tmp',
+  'lid-map.json',
+  'lid-map.json.tmp',
   'media',
 ]);
 
