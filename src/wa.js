@@ -13,13 +13,14 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 
 const SESSION_DIR = process.env.SESSION_DIR || '/session';
-// Shared state lives at /session root so all paired devices contribute to
-// a single message history. Per-user Baileys auth files live under
-// /session/baileys/<userId>/ — set explicitly via the constructor.
-const BUFFER_PATH = path.join(SESSION_DIR, 'buffer.json');
-const ANCHOR_PATH = path.join(SESSION_DIR, 'anchor.json');
-const CONTACTS_PATH = path.join(SESSION_DIR, 'contacts.json');
-const DIRECT_PEERS_PATH = path.join(SESSION_DIR, 'direct-peers.json');
+// The PRIMARY session's state lives at /session root: it holds the group
+// conversation, which is shared by definition, and consumers (the earl-tasks
+// Chat panel) have been reading these paths since before multi-device existed.
+// Secondary sessions get their own copies under /session/users/<userId>/ —
+// see storeDir in the constructor. Keeping them apart is not privacy theatre:
+// a message only means "sent by me" relative to the account that recorded it,
+// so one pile with one owner gets every secondary's direction backwards.
+// Per-user Baileys auth files live under /session/baileys/<userId>/.
 const MEDIA_DIR = path.join(SESSION_DIR, 'media');
 const RECONNECT_DELAY_MS = 2000;
 const REPLAY_BUFFER_LIMIT = 5000;
@@ -144,19 +145,39 @@ function extractContent(msg) {
 }
 
 export class WhatsAppClient extends EventEmitter {
-  constructor({ logger, groupJid, baileysDir, mode = 'primary' }) {
+  constructor({ logger, groupJid, baileysDir, storeDir, mode = 'primary' }) {
     super();
     this.logger = logger || pino({ level: 'info' });
     this.groupJid = groupJid || null;
     // Where Baileys persists its auth/session files for THIS device.
     // Each paired earl-tasks user gets their own dir.
     this.baileysDir = baileysDir || SESSION_DIR;
-    // 'primary' — listens to messages.upsert, history, contacts; owns the
-    // shared buffer/anchor/contacts/media. There is exactly one primary.
-    // 'sender-only' — used to relay outbound messages from another earl-tasks
-    // user via their own paired phone. Skips inbound subscriptions; primary
-    // still receives the echo and records it.
-    this.mode = mode;
+    // 'primary' — the group conversation plus its own 1:1s, stored at
+    // /session root. There is exactly one primary.
+    // 'secondary' — another person's phone. Records its own 1:1s only, into
+    // its own store, and never the group: all three of us sit in the Earl
+    // group, so three recording sessions would write every group message down
+    // three times. ('sender-only' is the old name and still accepted.)
+    this.mode = mode === 'sender-only' ? 'secondary' : mode;
+    this.isPrimary = this.mode === 'primary';
+    // Where this session's message store lives. Primary keeps the historic
+    // root paths so existing consumers are untouched.
+    this.storeDir = storeDir || SESSION_DIR;
+    this.bufferPath = path.join(this.storeDir, 'buffer.json');
+    this.anchorPath = path.join(this.storeDir, 'anchor.json');
+    this.contactsPath = path.join(this.storeDir, 'contacts.json');
+    this.directPeersPath = path.join(this.storeDir, 'direct-peers.json');
+    this.lidMapPath = path.join(this.storeDir, 'lid-map.json');
+    // WhatsApp is migrating 1:1 chats onto anonymous "@lid" addressing, so a
+    // conversation that used to arrive as 447700900123@s.whatsapp.net now
+    // arrives as 8012345678901@lid with no phone number in sight. Everything
+    // downstream — the allow-set, the CRM's resolver — is keyed on the number,
+    // so we keep our own map and translate at the door.
+    this.lidToPn = new Map();
+    this.lidMapFlushTimer = null;
+    // Jids we have already logged a refusal for, so a chatty non-contact
+    // doesn't fill the log. See _processMessage.
+    this.refusedJids = new Set();
     this.sock = null;
     this.qr = null;
     this.status = 'connecting';
@@ -181,12 +202,16 @@ export class WhatsAppClient extends EventEmitter {
     await fs.mkdir(SESSION_DIR, { recursive: true });
     await fs.mkdir(MEDIA_DIR, { recursive: true });
     await fs.mkdir(this.baileysDir, { recursive: true });
-    if (this.mode === 'primary') {
-      await this._loadBuffer();
-      await this._loadAnchor();
-      await this._loadContacts();
-      await this._loadDirectPeers();
-    }
+    await fs.mkdir(this.storeDir, { recursive: true });
+    // Every session loads its own store, secondaries included. The allow-set
+    // in particular has to be on disk before the socket opens: WhatsApp pushes
+    // the phone's history down within seconds of a pair, the recording gate is
+    // applied as each message arrives, and anything refused is gone for good.
+    await this._loadBuffer();
+    await this._loadContacts();
+    await this._loadDirectPeers();
+    await this._loadLidMap();
+    await this._loadAnchor();
     const { state, saveCreds } = await useMultiFileAuthState(this.baileysDir);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -204,11 +229,16 @@ export class WhatsAppClient extends EventEmitter {
 
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', (u) => this._onConnection(u));
-    if (this.mode === 'primary') {
-      sock.ev.on('messages.upsert', (u) => this._onMessages(u));
-      sock.ev.on('messaging-history.set', (u) => this._onHistory(u));
-      sock.ev.on('contacts.upsert', (cs) => this._onContacts(cs));
-      sock.ev.on('contacts.update', (cs) => this._onContacts(cs));
+    // Secondaries listen too, but _processMessage drops the group for them, so
+    // what they record is their own 1:1s with allow-set numbers and nothing
+    // else. A secondary with an empty allow-set records nothing at all, which
+    // is the same behaviour as the old sender-only mode: recording is opted
+    // into by pushing numbers, not by configuration.
+    sock.ev.on('messages.upsert', (u) => this._onMessages(u));
+    sock.ev.on('messaging-history.set', (u) => this._onHistory(u));
+    sock.ev.on('contacts.upsert', (cs) => this._onContacts(cs));
+    sock.ev.on('contacts.update', (cs) => this._onContacts(cs));
+    if (this.isPrimary) {
       sock.ev.on('groups.update', (events) => {
         for (const ev of events) {
           if (ev.id && ev.subject) {
@@ -219,25 +249,38 @@ export class WhatsAppClient extends EventEmitter {
       });
       // Presence (online / typing), read-receipt ticks, and edit/delete of our
       // own or others' messages. All additive — they only emit new event types.
+      //
+      // Primary only, deliberately. These drive the Chat panel, which reads the
+      // group, and the group is the primary's alone. A secondary broadcasting
+      // typing indicators for its owner's private 1:1s would be publishing
+      // something nobody asked to publish.
       sock.ev.on('presence.update', (u) => this._onPresence(u));
       sock.ev.on('message-receipt.update', (u) => this._onReceipts(u));
       sock.ev.on('messages.update', (u) => this._onMessageUpdates(u));
-    } else {
-      // sender-only sessions still need messages.upsert to track sentByMe so
-      // they can detect their own outgoing echoes (used for status feedback),
-      // but they never record to the shared buffer.
-      sock.ev.on('messages.upsert', ({ messages, type }) => {
-        if (type !== 'notify') return;
-        for (const msg of messages) {
-          if (msg.key?.fromMe && msg.key.id && this.sentByMe.has(msg.key.id)) {
-            this.sentByMe.delete(msg.key.id);
-          }
-        }
-      });
     }
   }
 
+  /** Cancel pending debounced writes and flush what they were going to write.
+   *  Without this a SIGTERM inside the 1.5s debounce window loses whatever
+   *  arrived in it, and a timer fires against a stopped client. */
+  async _settleWrites() {
+    for (const key of ['bufferFlushTimer', '_anchorFlushTimer', 'contactsFlushTimer', 'directPeersFlushTimer', 'lidMapFlushTimer']) {
+      if (this[key]) {
+        clearTimeout(this[key]);
+        this[key] = null;
+      }
+    }
+    await Promise.allSettled([
+      this._flushBuffer(),
+      this._flushAnchor(),
+      this._flushContacts(),
+      this._flushDirectPeers(),
+      this._flushLidMap(),
+    ]);
+  }
+
   async stop() {
+    await this._settleWrites();
     try {
       // Detach Baileys event handlers before tearing the socket down. Without
       // this, listeners hold the dead socket alive in Node's GC chain and
@@ -284,6 +327,11 @@ export class WhatsAppClient extends EventEmitter {
           }
         }
       }
+      // The allow-set is loaded from disk before the socket opens, so this is
+      // the first moment we can ask WhatsApp about it.
+      this._resolveLidsForPeers().catch((err) =>
+        this.logger.warn({ err }, 'lid resolution on connect failed'),
+      );
     }
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
@@ -311,8 +359,71 @@ export class WhatsAppClient extends EventEmitter {
         this.contacts.set(c.id, name);
         changed = true;
       }
+      // A contact carries both forms of its id when WhatsApp knows both. This
+      // is the only source that teaches us a peer's number BEFORE they have
+      // sent us anything, which matters because a chat we start ourselves
+      // arrives back @lid-addressed with only our own number attached.
+      this._learnLid(c.lid, c.jid);
+      if (c.id?.endsWith('@lid')) this._learnLid(c.id, c.jid);
+      if (c.id?.endsWith('@s.whatsapp.net')) this._learnLid(c.lid, c.id);
     }
     if (changed) this._scheduleContactsFlush();
+  }
+
+  /** Remember that an anonymous @lid id belongs to a phone number. */
+  _learnLid(lid, pn) {
+    if (!lid?.endsWith('@lid') || !pn?.endsWith('@s.whatsapp.net')) return;
+    const bareLid = lid.split(':')[0].split('@')[0] + '@lid';
+    const barePn = pn.split(':')[0].split('@')[0] + '@s.whatsapp.net';
+    if (this.lidToPn.get(bareLid) === barePn) return;
+    this.lidToPn.set(bareLid, barePn);
+    this._scheduleLidMapFlush();
+  }
+
+  /**
+   * Ask WhatsApp for the anonymous id behind each allow-set number.
+   *
+   * The other two sources are reactive: a peer's number arrives on their first
+   * inbound message, or in a contacts sync, which only lands in full on a fresh
+   * pair. Neither covers the case that matters most — a conversation we start,
+   * with a contact whose number the CRM has just been given — so without this a
+   * new number can sit unrecognised for as long as the chat stays one-way.
+   *
+   * Only numbers already on the allow-set are looked up, which is to say only
+   * numbers someone has deliberately put on a CRM record.
+   */
+  async _resolveLidsForPeers() {
+    if (this.status !== 'connected' || !this.sock) return;
+    const wanted = [...this.directPeers].filter((jid) => !this._lidFor(jid));
+    if (!wanted.length) return;
+    for (let i = 0; i < wanted.length; i += 50) {
+      const batch = wanted.slice(i, i + 50);
+      try {
+        const results = (await this.sock.onWhatsApp(...batch)) || [];
+        for (const r of results) this._learnLid(r?.lid, r?.jid);
+      } catch (err) {
+        this.logger.warn({ err, count: batch.length }, 'lid lookup failed');
+      }
+    }
+    this.logger.info(
+      { asked: wanted.length, known: this.lidToPn.size },
+      'resolved anonymous ids for allow-set numbers',
+    );
+  }
+
+  /** The anonymous id we hold for a phone JID, if any. */
+  _lidFor(pn) {
+    const bare = pn?.split(':')[0].split('@')[0] + '@s.whatsapp.net';
+    for (const [lid, mapped] of this.lidToPn) if (mapped === bare) return lid;
+    return null;
+  }
+
+  /** The phone-number JID behind a chat id, or null if we cannot tell. */
+  _pnFor(jid) {
+    if (!jid) return null;
+    if (jid.endsWith('@s.whatsapp.net')) return jid.split(':')[0].split('@')[0] + '@s.whatsapp.net';
+    if (!jid.endsWith('@lid')) return null;
+    return this.lidToPn.get(jid.split(':')[0].split('@')[0] + '@lid') || null;
   }
 
   async _primeGroupCache() {
@@ -405,10 +516,31 @@ export class WhatsAppClient extends EventEmitter {
     }
 
     const jid = msg.key.remoteJid;
+    // The counterparty's phone-number JID for a 1:1, filled in below. Everything
+    // downstream is keyed on the number, never on the anonymous id.
+    let peerPn = null;
     const isGroup = jid?.endsWith('@g.us');
-    const isDirect = jid?.endsWith('@s.whatsapp.net');
+    // A 1:1 chat now arrives addressed either way. Baileys hands us the peer's
+    // number alongside the anonymous id on inbound messages, so learn from
+    // every one that passes: an outbound-only chat has no sender_pn of the
+    // peer's and would otherwise never be identifiable.
+    const isDirect = jid?.endsWith('@s.whatsapp.net') || jid?.endsWith('@lid');
+    if (isDirect && !msg.key.fromMe) this._learnLid(jid, msg.key.senderPn);
+    if (isGroup) this._learnLid(msg.key.participantLid, msg.key.participantPn);
+
+    // Our own echo of a message this session just sent. Cleared here, above the
+    // jid gates, so a send to a number outside the allow-set still retires its
+    // entry instead of leaking one into sentByMe for the life of the process.
+    if (msg.key.fromMe && msg.key.id && this.sentByMe.has(msg.key.id)) {
+      this.sentByMe.delete(msg.key.id);
+      return false;
+    }
 
     if (isGroup) {
+      // Group is the primary's alone. All three directors sit in the Earl
+      // group, so a recording secondary would write every group message down a
+      // second and third time.
+      if (!this.isPrimary) return false;
       if (this.groupJid) {
         if (jid !== this.groupJid) return false;
       } else {
@@ -419,10 +551,38 @@ export class WhatsAppClient extends EventEmitter {
         return false;
       }
     } else if (isDirect) {
-      // Only capture 1:1 chats with people the engine has messaged (outreach
-      // peers in directPeers). Everything else — the owner's personal DMs — is
-      // ignored, so the sidecar never ingests unrelated private conversations.
-      if (!this.directPeers.has(jid)) return false;
+      // Only capture 1:1 chats with numbers on the allow-set the CRM pushes.
+      // Everything else — the owner's personal DMs — is ignored, so the sidecar
+      // never ingests unrelated private conversations.
+      //
+      // The allow-set is phone numbers, so an @lid chat has to be translated
+      // first. A lid we cannot translate is refused, and says so: guessing
+      // which contact an anonymous id belongs to is exactly the wrong-person
+      // match everything downstream is built to avoid.
+      peerPn = this._pnFor(jid);
+      if (!peerPn) {
+        if (!this.refusedJids.has(jid)) {
+          this.refusedJids.add(jid);
+          this.logger.info(
+            { jid, knownLids: this.lidToPn.size },
+            'refused 1:1 message: no phone number known for this @lid id',
+          );
+        }
+        return false;
+      }
+      if (!this.directPeers.has(peerPn)) {
+        // Say so, once per counterparty. Silently dropping made "no message
+        // arrived" and "a message arrived and was refused" look identical from
+        // outside, which is not a distinction anyone should have to guess at.
+        if (!this.refusedJids.has(peerPn)) {
+          this.refusedJids.add(peerPn);
+          this.logger.info(
+            { jid, peerPn, peers: this.directPeers.size },
+            'refused 1:1 message: counterparty is not on the allow-set',
+          );
+        }
+        return false;
+      }
     } else {
       return false;
     }
@@ -434,12 +594,13 @@ export class WhatsAppClient extends EventEmitter {
 
     const fromMe = !!msg.key.fromMe;
     const selfBare = this.sock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
-    const senderJid = fromMe ? selfBare : msg.key.participant || jid;
-
-    if (fromMe && this.sentByMe.has(msg.key.id)) {
-      this.sentByMe.delete(msg.key.id);
-      return false;
-    }
+    // Store the phone form throughout, whichever form it arrived in. Consumers
+    // read the chat id to work out who the conversation is with, and an
+    // anonymous id names nobody.
+    const chatJid = peerPn || jid;
+    const senderJid = fromMe
+      ? selfBare
+      : peerPn || msg.key.participant || jid;
 
     if (msg.key.id && this.recentIndex.has(msg.key.id)) return false;
 
@@ -461,7 +622,7 @@ export class WhatsAppClient extends EventEmitter {
 
     const out = {
       id: msg.key.id,
-      groupJid: jid,
+      groupJid: chatJid,
       senderJid,
       senderName,
       body: text || '',
@@ -707,14 +868,14 @@ export class WhatsAppClient extends EventEmitter {
       (a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp),
     );
     this.recent = sorted;
-    const tmp = `${BUFFER_PATH}.tmp`;
+    const tmp = `${this.bufferPath}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(sorted), 'utf-8');
-    await fs.rename(tmp, BUFFER_PATH);
+    await fs.rename(tmp, this.bufferPath);
   }
 
   async _loadBuffer() {
     try {
-      const raw = await fs.readFile(BUFFER_PATH, 'utf-8');
+      const raw = await fs.readFile(this.bufferPath, 'utf-8');
       const arr = JSON.parse(raw);
       if (Array.isArray(arr)) {
         this.recent = arr.slice(-REPLAY_BUFFER_LIMIT);
@@ -740,14 +901,14 @@ export class WhatsAppClient extends EventEmitter {
 
   async _flushAnchor() {
     if (!this.oldestAnchor) return;
-    const tmp = `${ANCHOR_PATH}.tmp`;
+    const tmp = `${this.anchorPath}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(this.oldestAnchor), 'utf-8');
-    await fs.rename(tmp, ANCHOR_PATH);
+    await fs.rename(tmp, this.anchorPath);
   }
 
   async _loadAnchor() {
     try {
-      const raw = await fs.readFile(ANCHOR_PATH, 'utf-8');
+      const raw = await fs.readFile(this.anchorPath, 'utf-8');
       const obj = JSON.parse(raw);
       if (obj?.key && obj?.timestamp) {
         this.oldestAnchor = obj;
@@ -772,14 +933,14 @@ export class WhatsAppClient extends EventEmitter {
 
   async _flushContacts() {
     const obj = Object.fromEntries(this.contacts);
-    const tmp = `${CONTACTS_PATH}.tmp`;
+    const tmp = `${this.contactsPath}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(obj), 'utf-8');
-    await fs.rename(tmp, CONTACTS_PATH);
+    await fs.rename(tmp, this.contactsPath);
   }
 
   async _loadContacts() {
     try {
-      const raw = await fs.readFile(CONTACTS_PATH, 'utf-8');
+      const raw = await fs.readFile(this.contactsPath, 'utf-8');
       const obj = JSON.parse(raw);
       if (obj && typeof obj === 'object') {
         for (const [k, v] of Object.entries(obj)) this.contacts.set(k, v);
@@ -788,6 +949,37 @@ export class WhatsAppClient extends EventEmitter {
     } catch (err) {
       if (err.code !== 'ENOENT') {
         this.logger.warn({ err }, 'failed to load contacts');
+      }
+    }
+  }
+
+  _scheduleLidMapFlush() {
+    if (this.lidMapFlushTimer) return;
+    this.lidMapFlushTimer = setTimeout(() => {
+      this.lidMapFlushTimer = null;
+      this._flushLidMap().catch((err) =>
+        this.logger.warn({ err }, 'lid map flush failed'),
+      );
+    }, BUFFER_FLUSH_DEBOUNCE_MS);
+  }
+
+  async _flushLidMap() {
+    const tmp = `${this.lidMapPath}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(Object.fromEntries(this.lidToPn)), 'utf-8');
+    await fs.rename(tmp, this.lidMapPath);
+  }
+
+  async _loadLidMap() {
+    try {
+      const raw = await fs.readFile(this.lidMapPath, 'utf-8');
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') {
+        for (const [k, v] of Object.entries(obj)) this.lidToPn.set(k, v);
+        this.logger.info({ count: this.lidToPn.size }, 'lid map loaded from disk');
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        this.logger.warn({ err }, 'failed to load lid map');
       }
     }
   }
@@ -808,15 +1000,51 @@ export class WhatsAppClient extends EventEmitter {
     this._scheduleDirectPeersFlush();
   }
 
+  /**
+   * Replace the direct-peer allow-set with an externally-owned list.
+   *
+   * The set otherwise grows only from sendText, which means a thread is captured
+   * only if its first message went out through this API. Message someone from
+   * the phone, as anyone actually would, and their replies are never seen.
+   *
+   * The Earl CRM pushes the phone numbers it holds on contact records here, so
+   * the allow-set becomes "people the business has deliberately recorded"
+   * rather than "people we happened to message through the bridge". Numbers
+   * arrive E.164 and are converted to JIDs.
+   *
+   * Deliberately a REPLACE, not a merge: removing someone from the CRM has to
+   * actually revoke capture. A merge would make the set grow-only, so "delete
+   * the contact" would quietly not mean "stop reading their messages".
+   */
+  setDirectPeers(numbers) {
+    const next = new Set();
+    for (const raw of numbers || []) {
+      const digits = String(raw).replace(/[^\d]/g, '');
+      if (digits.length >= 7 && digits.length <= 15) next.add(`${digits}@s.whatsapp.net`);
+    }
+    this.directPeers = next;
+    // Forget what we've already grumbled about: a number dropped from the list
+    // deserves a fresh refusal line if it turns up again.
+    this.refusedJids.clear();
+    this._scheduleDirectPeersFlush();
+    // A new number is useless to us until we can recognise its chat in either
+    // addressing form, and the CRM pushes this list the moment someone saves a
+    // mobile. Fire and forget: a lookup that fails is retried on the next push.
+    this._resolveLidsForPeers().catch((err) =>
+      this.logger.warn({ err }, 'lid resolution after peer push failed'),
+    );
+    return next.size;
+  }
+
   async _flushDirectPeers() {
-    const tmp = `${DIRECT_PEERS_PATH}.tmp`;
+    const tmp = `${this.directPeersPath}.tmp`;
     await fs.writeFile(tmp, JSON.stringify([...this.directPeers]), 'utf-8');
-    await fs.rename(tmp, DIRECT_PEERS_PATH);
+    await fs.rename(tmp, this.directPeersPath);
   }
 
   async _loadDirectPeers() {
     try {
-      const raw = await fs.readFile(DIRECT_PEERS_PATH, 'utf-8');
+      const raw = await fs.readFile(this.directPeersPath, 'utf-8');
       const arr = JSON.parse(raw);
       if (Array.isArray(arr)) {
         for (const j of arr) this.directPeers.add(j);
@@ -856,17 +1084,30 @@ export class WhatsAppClient extends EventEmitter {
   getStatus() {
     return {
       status: this.status,
-      groupJid: this.groupJid,
-      groupName: this.groupJid
+      mode: this.mode,
+      groupJid: this.isPrimary ? this.groupJid : null,
+      groupName: this.isPrimary && this.groupJid
         ? this.groupNameCache.get(this.groupJid)?.subject || null
         : null,
       self: this.sock?.user?.id || null,
+      // How many numbers this session may record, and how much it holds. A
+      // session reading "connected" while watching nobody is the failure mode
+      // worth being able to see.
+      peers: this.directPeers.size,
+      buffered: this.recent.length,
+      // How many anonymous @lid ids we can put a number to. A 1:1 whose id we
+      // cannot translate is refused, so this being zero explains a silent feed.
+      knownLids: this.lidToPn.size,
     };
   }
 
-  recentMessages({ sinceIso, limit } = {}) {
+  recentMessages({ sinceIso, limit, directOnly = false } = {}) {
     const sinceTs = sinceIso ? Date.parse(sinceIso) : 0;
-    const items = this.recent.filter((m) => Date.parse(m.timestamp) > sinceTs);
+    let items = this.recent.filter((m) => Date.parse(m.timestamp) > sinceTs);
+    // `groupJid` on a stored message is the CHAT jid despite the name, so a 1:1
+    // carries the counterparty there. Filtering here rather than in every
+    // consumer keeps "the CRM never sees the group" a property of one line.
+    if (directOnly) items = items.filter((m) => !(m.groupJid || '').endsWith('@g.us'));
     if (limit && items.length > limit) return items.slice(-limit);
     return items;
   }

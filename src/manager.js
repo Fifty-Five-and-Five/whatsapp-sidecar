@@ -5,19 +5,32 @@ import { WhatsAppClient } from './wa.js';
 
 const SESSION_DIR = process.env.SESSION_DIR || '/session';
 const BAILEYS_ROOT = path.join(SESSION_DIR, 'baileys');
+const USERS_ROOT = path.join(SESSION_DIR, 'users');
 
-// Files at /session root are SHARED across all paired devices (the canonical
-// message buffer, history anchor, contact name map, downloaded media).
-// Everything else in /session predates the multi-device refactor and belongs
-// to the primary device — we migrate it on first boot.
+// Files at /session root belong to the PRIMARY session's store (the message
+// buffer, history anchor, contact name map, allow-set) plus genuinely shared
+// state (downloaded media). Everything else in /session predates the
+// multi-device refactor and is Baileys auth for the primary device — we
+// migrate it on first boot.
+//
+// Anything the primary writes at root MUST be listed here. It is a deny-list
+// by omission: an unlisted file is taken for stray Baileys auth and moved into
+// the auth directory, where it is silently lost. `direct-peers.json` was
+// missing and would have been swallowed on the next restart, taking the
+// capture allow-set with it.
 const SHARED_TOP_LEVEL = new Set([
   'baileys',
+  'users',
   'buffer.json',
   'buffer.json.tmp',
   'anchor.json',
   'anchor.json.tmp',
   'contacts.json',
   'contacts.json.tmp',
+  'direct-peers.json',
+  'direct-peers.json.tmp',
+  'lid-map.json',
+  'lid-map.json.tmp',
   'media',
 ]);
 
@@ -110,17 +123,23 @@ export class SessionManager extends EventEmitter {
       const userId = e.name;
       if (userId === this.primaryUserId) continue;
       if (!isValidUserId(userId)) continue;
-      await this._launchClient(userId, 'sender-only');
+      await this._launchClient(userId, 'secondary');
     }
   }
 
   async _launchClient(userId, mode) {
     const baileysDir = path.join(BAILEYS_ROOT, userId);
+    // The primary keeps the historic root paths; secondaries get their own
+    // store so each person's 1:1s stay attributable to the account that
+    // recorded them, and so nothing of theirs reaches the shared stream the
+    // earl-tasks Chat panel reads.
+    const storeDir = mode === 'primary' ? SESSION_DIR : path.join(USERS_ROOT, userId);
     const logger = this.logger.child({ session: userId.slice(0, 8), mode });
     const client = new WhatsAppClient({
       logger,
       groupJid: this.groupJid,
       baileysDir,
+      storeDir,
       mode,
     });
     // Only the primary's stream of events drives the Manager's fan-out. Sender-
@@ -201,7 +220,7 @@ export class SessionManager extends EventEmitter {
     if (existing) {
       await this.deleteSession(userId);
     }
-    const mode = userId === this.primaryUserId ? 'primary' : 'sender-only';
+    const mode = userId === this.primaryUserId ? 'primary' : 'secondary';
     return this._launchClient(userId, mode);
   }
 
@@ -217,10 +236,41 @@ export class SessionManager extends EventEmitter {
     }
     const dir = path.join(BAILEYS_ROOT, userId);
     await fs.rm(dir, { recursive: true, force: true });
-    // Note for primary: shared buffer/anchor/contacts/media stay because they
+    // Note for primary: buffer/anchor/contacts/allow-set/media stay because they
     // live at /session root, not in /session/baileys/. Re-pairing the primary
     // resumes inbound flow without losing any history we've already persisted
     // to the earl-tasks DB.
+    //
+    // A secondary is different. Unpairing is how someone withdraws their phone,
+    // so their captured messages and their allow-set go with it. Anything
+    // already synced is safe in the CRM's own database.
+    if (userId !== this.primaryUserId) {
+      await fs.rm(path.join(USERS_ROOT, userId), { recursive: true, force: true });
+    }
+  }
+
+  // ---- per-session capture --------------------------------------------------
+
+  /** Replace one session's 1:1 allow-set. Returns the number of entries. */
+  setPeersFor(userId, numbers) {
+    const client = this.clients.get(userId);
+    if (!client) {
+      const err = new Error('not paired');
+      err.code = 'NOT_PAIRED';
+      throw err;
+    }
+    return client.setDirectPeers(numbers);
+  }
+
+  /** One session's own messages. `directOnly` drops the group. */
+  messagesFor(userId, opts) {
+    const client = this.clients.get(userId);
+    if (!client) {
+      const err = new Error('not paired');
+      err.code = 'NOT_PAIRED';
+      throw err;
+    }
+    return client.recentMessages(opts);
   }
 
   // Shared buffer / history / events all live on the primary client.
@@ -238,12 +288,24 @@ export class SessionManager extends EventEmitter {
     return p.fetchOlder(count);
   }
 
+  // Media files land in one shared directory keyed by message id, so the path
+  // lookup does not care which session downloaded it. The metadata does: ask
+  // every session, not just the primary, or an attachment in a secondary's
+  // thread serves with the wrong content-type or not at all.
   mediaPathFor(id) {
-    return this.primary()?.mediaPathFor(id) || null;
+    for (const client of this.clients.values()) {
+      const p = client.mediaPathFor(id);
+      if (p) return p;
+    }
+    return null;
   }
 
   bufferEntryById(id) {
-    return this.primary()?.recent.find((m) => m.id === id) || null;
+    for (const client of this.clients.values()) {
+      const hit = client.recent.find((m) => m.id === id);
+      if (hit) return hit;
+    }
+    return null;
   }
 
   primaryStatus() {
